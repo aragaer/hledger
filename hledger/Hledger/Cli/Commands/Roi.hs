@@ -241,7 +241,7 @@ internalRateOfReturn showCashFlow prettyTables (OneSpan spanBegin spanEnd valueB
       (Table
        (Tbl.Group NoLine (map (Header . showDate) dates))
        (Tbl.Group SingleLine [Header "Amount"])
-       (map ((:[]) . show) amounts))
+       (map ((:[]) . showAmount) amounts))
 
   -- 0% is always a solution, so require at least something here
   case totalCF of
