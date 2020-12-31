@@ -45,10 +45,10 @@ roimode = hledgerCommandMode
 data OneSpan = OneSpan
   Day -- start date, inclusive
   Day   -- end date, exclusive
-  Quantity -- value of investment at the beginning of day on spanBegin_
-  Quantity  -- value of investment at the end of day on spanEnd_
-  [(Day,Quantity)] -- all deposits and withdrawals (but not changes of value) in the DateSpan [spanBegin_,spanEnd_)
-  [(Day,Quantity)] -- all PnL changes of the value of investment in the DateSpan [spanBegin_,spanEnd_)
+  Amount -- value of investment at the beginning of day on spanBegin_
+  Amount  -- value of investment at the end of day on spanEnd_
+  [(Day,Amount)] -- all deposits and withdrawals (but not changes of value) in the DateSpan [spanBegin_,spanEnd_)
+  [(Day,Amount)] -- all PnL changes of the value of investment in the DateSpan [spanBegin_,spanEnd_)
  deriving (Show)
 
 
@@ -57,8 +57,11 @@ roi CliOpts{rawopts_=rawopts, reportspec_=rspec} j = do
   d <- getCurrentDay
   let
     ropts = rsOpts rspec
+    today = rsToday rspec
     showCashFlow = boolopt "cashflow" rawopts
     prettyTables = pretty_tables_ ropts
+    valuation = value_ ropts
+    infer = infer_value_ ropts
     makeQuery flag = do
         q <- either usageError (return . fst) . parseQuery d . T.pack $ stringopt flag rawopts
         return . simplifyQuery $ And [queryFromFlags ropts{period_=PeriodAll}, q]
@@ -67,6 +70,9 @@ roi CliOpts{rawopts_=rawopts, reportspec_=rspec} j = do
   pnlQuery         <- makeQuery "pnl"
 
   let
+    priceoracle = journalPriceOracle infer j
+    styles      = journalCommodityStyles j
+    valuate = transactionApplyValuation priceoracle styles
     trans = dbg3 "investments" $ jtxns $ filterJournalTransactions investmentsQuery j
 
     journalSpan =
@@ -91,37 +97,42 @@ roi CliOpts{rawopts_=rawopts, reportspec_=rspec} j = do
   tableBody <- forM spans $ \(DateSpan (Just spanBegin) (Just spanEnd)) -> do
     -- Spans are [spanBegin,spanEnd), and spanEnd is 1 day after then actual end date we are interested in
     let
+      trans' = case valuation of
+        Nothing        -> trans
+        Just valuation -> map (flip (valuate spanEnd today) valuation) trans
       valueBefore =
-        total trans (And [ investmentsQuery
-                         , Date (DateSpan Nothing (Just spanBegin))])
+        total trans' (And [ investmentsQuery
+                          , Date (DateSpan Nothing (Just spanBegin))])
 
       valueAfter  =
-        total trans (And [investmentsQuery
-                         , Date (DateSpan Nothing (Just spanEnd))])
+        total trans' (And [investmentsQuery
+                          , Date (DateSpan Nothing (Just spanEnd))])
 
       cashFlow =
-        calculateCashFlow trans (And [ Not investmentsQuery
-                                     , Not pnlQuery
-                                     , Date (DateSpan (Just spanBegin) (Just spanEnd)) ] )
+        calculateCashFlow trans' (And [ Not investmentsQuery
+                                      , Not pnlQuery
+                                      , Date (DateSpan (Just spanBegin) (Just spanEnd)) ] )
 
       pnl =
-        calculateCashFlow trans (And [ Not investmentsQuery
-                                     , pnlQuery
-                                     , Date (DateSpan (Just spanBegin) (Just spanEnd)) ] )
+        calculateCashFlow trans' (And [ Not investmentsQuery
+                                      , pnlQuery
+                                      , Date (DateSpan (Just spanBegin) (Just spanEnd)) ] )
 
       thisSpan = dbg3 "processing span" $
                  OneSpan spanBegin spanEnd valueBefore valueAfter cashFlow pnl
 
     irr <- internalRateOfReturn showCashFlow prettyTables thisSpan
-    twr <- timeWeightedReturn showCashFlow prettyTables investmentsQuery trans thisSpan
+    twr <- timeWeightedReturn showCashFlow prettyTables investmentsQuery trans' thisSpan
     let cashFlowAmt = negate $ sum $ map snd cashFlow
     let smallIsZero x = if abs x < 0.01 then 0.0 else x
     return [ showDate spanBegin
            , showDate (addDays (-1) spanEnd)
-           , show valueBefore
-           , show cashFlowAmt
-           , show valueAfter
-           , show (valueAfter - (valueBefore + cashFlowAmt))
+           , showAmount valueBefore
+           , showAmount cashFlowAmt
+           , showAmount valueAfter
+           , showAmount $ if amountLooksZero cashFlowAmt
+                            then (valueAfter - valueBefore)
+                            else (valueAfter - (valueBefore + cashFlowAmt))
            , printf "%0.2f%%" $ smallIsZero irr
            , printf "%0.2f%%" $ smallIsZero twr ]
 
@@ -137,7 +148,7 @@ roi CliOpts{rawopts_=rawopts, reportspec_=rspec} j = do
 
 timeWeightedReturn showCashFlow prettyTables investmentsQuery trans (OneSpan spanBegin spanEnd valueBefore valueAfter cashFlow pnl) = do
   let initialUnitPrice = 100
-  let initialUnits = valueBefore / initialUnitPrice
+  let initialUnits = aquantity valueBefore / initialUnitPrice
   let changes =
         -- If cash flow and PnL changes happen on the same day, this
         -- will sort PnL changes to come before cash flows (on any
@@ -162,19 +173,19 @@ timeWeightedReturn showCashFlow prettyTables investmentsQuery trans (OneSpan spa
              case amt of
                Right amt ->
                  -- we are buying or selling
-                 let unitsBoughtOrSold = amt / unitPrice
+                 let unitsBoughtOrSold = aquantity amt / unitPrice
                  in (valueOnDate, unitsBoughtOrSold, unitPrice, unitBalance + unitsBoughtOrSold)
                Left pnl ->
                  -- PnL change
                  let valueAfterDate = valueOnDate + pnl
-                     unitPrice' = valueAfterDate/unitBalance
+                     unitPrice' = aquantity valueAfterDate/unitBalance
                  in (valueOnDate, 0, unitPrice', unitBalance))
-          (0, 0, initialUnitPrice, initialUnits)
+          (valueBefore{aquantity=0}, 0, initialUnitPrice, initialUnits)
           changes
 
   let finalUnitBalance = if null units then initialUnits else let (_,_,_,u) = last units in u
       finalUnitPrice = if finalUnitBalance == 0 then initialUnitPrice
-                       else valueAfter / finalUnitBalance
+                       else aquantity valueAfter / finalUnitBalance
       -- Technically, totalTWR should be (100*(finalUnitPrice - initialUnitPrice) / initialUnitPrice), but initalUnitPrice is 100, so 100/100 == 1
       totalTWR = roundTo 2 $ (finalUnitPrice - initialUnitPrice)
       years = fromIntegral (diffDays spanEnd spanBegin) / 365 :: Double
@@ -203,15 +214,15 @@ timeWeightedReturn showCashFlow prettyTables investmentsQuery trans (OneSpan spa
                          , Tbl.Group SingleLine [Header "Pnl", Header "Cashflow", Header "Unit price", Header "Units"]
                          , Tbl.Group SingleLine [Header "New Unit Balance"]])
        [ [value, oldBalance, pnl, cashflow, prc, udelta, balance]
-       | value <- map s valuesOnDate
+       | value <- map (s.aquantity) valuesOnDate
        | oldBalance <- map s (0:unitBalances)
        | balance <- map s unitBalances
-       | pnl <- map s pnls
-       | cashflow <- map s cashflows
+       | pnl <- map (s.aquantity) pnls
+       | cashflow <- map (s.aquantity) cashflows
        | prc <- map s unitPrices
        | udelta <- map s unitsBoughtOrSold ])
 
-    printf "Final unit price: %s/%s units = %s\nTotal TWR: %s%%.\nPeriod: %.2f years.\nAnnualized TWR: %.2f%%\n\n" (s valueAfter) (s finalUnitBalance) (s finalUnitPrice) (s totalTWR) years annualizedTWR
+    printf "Final unit price: %s/%s units = %s\nTotal TWR: %s%%.\nPeriod: %.2f years.\nAnnualized TWR: %.2f%%\n\n" (s $ aquantity valueAfter) (s finalUnitBalance) (s finalUnitPrice) (s totalTWR) years annualizedTWR
 
   return annualizedTWR
 
@@ -244,11 +255,11 @@ internalRateOfReturn showCashFlow prettyTables (OneSpan spanBegin spanEnd valueB
         SearchFailed -> error' $ "Error (SearchFailed): Failed to find solution for Internal Rate of Return (IRR).\n"
                         ++       "  Either search does not converge to a solution, or converges too slowly."
 
-type CashFlow = [(Day, Quantity)]
+type CashFlow = [(Day, Amount)]
 
 interestSum :: Day -> CashFlow -> Double -> Double
 interestSum referenceDay cf rate = sum $ map go cf
-    where go (t,m) = fromRational (toRational m) * (rate ** (fromIntegral (referenceDay `diffDays` t) / 365))
+    where go (t,m) = fromRational (toRational $ aquantity m) * (rate ** (fromIntegral (referenceDay `diffDays` t) / 365))
 
 
 calculateCashFlow :: [Transaction] -> Query -> CashFlow
@@ -256,11 +267,11 @@ calculateCashFlow trans query = filter ((/=0).snd) $ map go trans
     where
     go t = (transactionDate2 t, total [t] query)
 
-total :: [Transaction] -> Query -> Quantity
+total :: [Transaction] -> Query -> Amount
 total trans query = unMix $ sumPostings $  filter (matchesPosting query) $ concatMap realPostings trans
 
-unMix :: MixedAmount -> Quantity
+unMix :: MixedAmount -> Amount
 unMix a =
   case (normaliseMixedAmount $ mixedAmountCost a) of
-    (Mixed [a]) -> aquantity a
+    (Mixed [a]) -> a
     _ -> error' "MixedAmount failed to normalize"  -- PARTIAL:
